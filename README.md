@@ -2,6 +2,7 @@
 
 [![Go Version](https://img.shields.io/github/go-mod/go-version/hellocashmere/teleflow)](https://go.dev/)
 [![Go Reference](https://pkg.go.dev/badge/github.com/hellocashmere/teleflow.svg)](https://pkg.go.dev/github.com/hellocashmere/teleflow)
+[![Tests](https://github.com/hellocashmere/teleflow/actions/workflows/tests.yml/badge.svg)](https://github.com/hellocashmere/teleflow/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/hellocashmere/teleflow/branch/main/graph/badge.svg)](https://codecov.io/gh/hellocashmere/teleflow)
 [![License](https://img.shields.io/github/license/hellocashmere/teleflow)](LICENSE)
 
@@ -9,9 +10,17 @@
 go get github.com/hellocashmere/teleflow
 ```
 
+- [Overview](#overview)
 - [Getting Started](#getting-started)
 - [Context](#context)
 - [License](#license)
+
+# Overview
+
+Teleflow is a package which is designed to solve the problem of dialogs using
+[Telebot](https://github.com/tucnak/telebot). It provides a simple and efficient
+way to receive and process both input text and is capable of handling button
+clicks, location sending, contacts, etc.
 
 # Getting Started
 
