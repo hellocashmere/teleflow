@@ -5,15 +5,25 @@ import (
 	"time"
 )
 
-// Storage defines a global interface for key-value storage systems.
-// Uses in-memory storage by default.
 type Storage interface {
-	// Get gets a value by key.
-	Get(key string) (interface{}, error)
+	// Get returns a value or ErrKeyNotFound.
+	Get(ctx context.Context, key string) ([]byte, error)
 
-	// Set sets a value by key with an expiration time.
-	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
+	// Set stores a value with optional expiration.
+	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
 
-	// Delete deletes a value by key.
-	Delete(key string) error
+	// Delete removes a value and ignores missing keys.
+	Delete(ctx context.Context, key string) error
+
+	// CompareAndSwap replaces expected or creates a missing key when expected is nil.
+	CompareAndSwap(
+		ctx context.Context,
+		key string,
+		expected []byte,
+		value []byte,
+		expiration time.Duration,
+	) (bool, error)
+
+	// CompareAndDelete removes a key only when its value matches expected.
+	CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
 }
