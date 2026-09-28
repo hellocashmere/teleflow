@@ -1,104 +1,347 @@
 package teleflow
 
 import (
-	tele "gopkg.in/telebot.v4"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
+
+	tele "gopkg.in/telebot.v4"
 )
 
-// Flow is a builder for defining a sequence of steps in a user interaction flow.
+const (
+	// DefaultIdleTimeout is used when FlowConfig.IdleTimeout is zero.
+	DefaultIdleTimeout = 24 * time.Hour
+
+	// DefaultHistoryLimit is used when FlowConfig.HistoryLimit is zero.
+	DefaultHistoryLimit = 64
+
+	// MaxRuntimeStateSize limits serialized state loaded from or written to storage.
+	MaxRuntimeStateSize = 1 << 20
+)
+
+var (
+	ErrFlowNotBuilt     = errors.New("flow: definition is not built")
+	ErrStepNameEmpty    = errors.New("flow: step name cannot be empty")
+	ErrStepEventEmpty   = errors.New("flow: step event cannot be empty")
+	ErrStepDuplicate    = errors.New("flow: duplicate step")
+	ErrStepHandlerNil   = errors.New("flow: step handler cannot be nil")
+	ErrRuntimeStateSize = errors.New("flow: runtime state is too large")
+)
+
+// FlowConfig is used to configure a flow.
+type FlowConfig struct {
+	// Name identifies the flow and must not be empty.
+	Name string
+
+	// Version identifies the flow definition and must be greater than zero.
+	Version uint
+
+	// IdleTimeout sets when inactive state expires and uses DefaultIdleTimeout when zero.
+	IdleTimeout time.Duration
+
+	// HistoryLimit sets the retained step count and uses DefaultHistoryLimit when zero.
+	HistoryLimit int
+}
+
+// Flow describes a registered flow definition and its ordered steps.
 type Flow struct {
-	name string
+	owner *bus
 
-	steps []*Step
+	name    string
+	version uint
 
-	okFn  StateHandler
-	errFn ErrHandler
+	idleTimeout  time.Duration
+	historyLimit int
 
-	timeout time.Duration
-	start   time.Time
+	steps     []*Step
+	byName    map[string]*Step
+	positions map[string]int
 
-	mu sync.RWMutex
+	mu    sync.RWMutex
+	built bool
 }
 
-// OnText adds a step that triggers on text messages.
-func (f *Flow) OnText(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnText, beginFn)
+type runtimeState struct {
+	FlowName     string                     `json:"flow_name"`
+	FlowVersion  uint                       `json:"flow_version"`
+	CurrentStep  string                     `json:"current_step"`
+	History      []string                   `json:"history"`
+	Data         map[string]json.RawMessage `json:"data"`
+	StartedAt    time.Time                  `json:"started_at"`
+	LastActivity time.Time                  `json:"last_activity"`
+	LastUpdateID int                        `json:"last_update_id,omitempty"`
+	PendingBegin bool                       `json:"pending_begin,omitempty"`
+	Revision     uint64                     `json:"revision,omitempty"`
+	LeaseUntil   time.Time                  `json:"lease_until,omitzero"`
 }
 
-// OnCallback adds a step that triggers on callback queries.
-func (f *Flow) OnCallback(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnCallback, beginFn)
+func cloneRuntime(src *runtimeState) *runtimeState {
+	dst := *src
+
+	dst.History = append([]string(nil), src.History...)
+	dst.Data = make(map[string]json.RawMessage, len(src.Data))
+	for k, v := range src.Data {
+		dst.Data[k] = append(json.RawMessage(nil), v...)
+	}
+
+	return &dst
 }
 
-// OnPhoto adds a step that triggers on photo messages.
-func (f *Flow) OnPhoto(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnPhoto, beginFn)
+func encodeRuntime(state *runtimeState) ([]byte, error) {
+	value, err := json.Marshal(state)
+	if err != nil {
+		return nil, fmt.Errorf("flow: encode runtime state: %w", err)
+	}
+
+	if len(value) > MaxRuntimeStateSize {
+		return nil, ErrRuntimeStateSize
+	}
+
+	return value, nil
 }
 
-// OnAudio adds a step that triggers on audio messages.
-func (f *Flow) OnAudio(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnAudio, beginFn)
+func decodeRuntime(value []byte) (*runtimeState, error) {
+	if len(value) == 0 {
+		return nil, ErrInvalidRuntimeState
+	}
+
+	if len(value) > MaxRuntimeStateSize {
+		return nil, ErrRuntimeStateSize
+	}
+
+	var state runtimeState
+	if err := json.Unmarshal(value, &state); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidRuntimeState, err)
+	}
+
+	invalidIdentity := state.FlowName == "" || state.FlowVersion == 0 || state.CurrentStep == ""
+	invalidTime := state.StartedAt.IsZero() || state.LastActivity.IsZero() || state.LastActivity.Before(state.StartedAt)
+	if invalidIdentity || invalidTime || len(state.History) == 0 {
+		return nil, ErrInvalidRuntimeState
+	}
+
+	if state.Data == nil {
+		state.Data = make(map[string]json.RawMessage)
+	}
+
+	for _, value := range state.Data {
+		if !json.Valid(value) {
+			return nil, ErrInvalidRuntimeState
+		}
+	}
+
+	return &state, nil
 }
 
-// OnDocument adds a step that triggers on document messages.
-func (f *Flow) OnDocument(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnDocument, beginFn)
+// Name returns the flow definition name.
+func (f *Flow) Name() string {
+	return f.name
 }
 
-// OnVideo adds a step that triggers on video messages.
-func (f *Flow) OnVideo(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnVideo, beginFn)
+// Version returns the flow definition version.
+func (f *Flow) Version() uint {
+	return f.version
 }
 
-// OnVoice adds a step that triggers on voice messages.
-func (f *Flow) OnVoice(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnVoice, beginFn)
+// Step adds a named step to the flow draft.
+func (f *Flow) Step(
+	name string,
+	event string,
+	begin BeginFunc,
+	handle HandleFunc,
+) {
+	var beginContext BeginContextFunc
+	if begin != nil {
+		beginContext = func(_ context.Context, c tele.Context) error {
+			return begin(c)
+		}
+	}
+
+	var handleContext HandleContextFunc
+	if handle != nil {
+		handleContext = func(_ context.Context, c tele.Context, flowContext Context) (StepResult, error) {
+			return handle(c, flowContext)
+		}
+	}
+
+	f.addStep(name, event, beginContext, handleContext)
 }
 
-// OnContact adds a step that triggers on contact messages.
-func (f *Flow) OnContact(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnContact, beginFn)
+// StepContext adds a context-aware named step to the flow draft.
+func (f *Flow) StepContext(
+	name string,
+	event string,
+	begin BeginContextFunc,
+	handle HandleContextFunc,
+) {
+	f.addStep(name, event, begin, handle)
 }
 
-// OnLocation adds a step that triggers on location messages.
-func (f *Flow) OnLocation(beginFn StateHandler) *Step {
-	return f.addStep(tele.OnLocation, beginFn)
+func (f *Flow) addStep(
+	name string,
+	event string,
+	begin BeginContextFunc,
+	handle HandleContextFunc,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.built {
+		return
+	}
+
+	f.steps = append(f.steps, &Step{
+		name:   name,
+		on:     event,
+		begin:  begin,
+		handle: handle,
+	})
 }
 
-func (f *Flow) addStep(on string, beginFn StateHandler) *Step {
+// Build validates and registers the immutable flow definition.
+func (f *Flow) Build() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.built {
+		return nil
+	}
+
+	if f.name == "" {
+		return ErrNameEmpty
+	}
+
+	if f.version == 0 {
+		return ErrVersionInvalid
+	}
+
+	if f.idleTimeout < 0 {
+		return ErrIdleTimeoutNegative
+	}
+
+	if f.historyLimit < 0 {
+		return ErrHistoryLimitNegative
+	}
+
+	if len(f.steps) == 0 {
+		return ErrNoStepsDefined
+	}
+
+	byName := make(map[string]*Step, len(f.steps))
+	positions := make(map[string]int, len(f.steps))
+	for i, step := range f.steps {
+		if step.name == "" {
+			return ErrStepNameEmpty
+		}
+
+		if step.on == "" {
+			return fmt.Errorf("%w: step %q", ErrStepEventEmpty, step.name)
+		}
+
+		if step.handle == nil {
+			return fmt.Errorf("%w: step %q", ErrStepHandlerNil, step.name)
+		}
+
+		if _, exists := byName[step.name]; exists {
+			return fmt.Errorf("%w: %q", ErrStepDuplicate, step.name)
+		}
+
+		byName[step.name] = step
+		positions[step.name] = i
+	}
+
+	if f.owner == nil {
+		return ErrDefinitionNotRegistered
+	}
+
+	if f.idleTimeout == 0 {
+		f.idleTimeout = DefaultIdleTimeout
+	}
+
+	if f.historyLimit == 0 {
+		f.historyLimit = DefaultHistoryLimit
+	}
+
+	if err := f.owner.register(f); err != nil {
+		return err
+	}
+
+	f.byName = byName
+	f.positions = positions
+	f.built = true
+
+	return nil
+}
+
+func (f *Flow) ready() error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	// simple autoincrement.
-	id := len(f.steps)
-
-	step := &Step{
-		id:      id,
-		on:      on,
-		beginFn: beginFn,
+	if !f.built {
+		return ErrFlowNotBuilt
 	}
-	f.steps = append(f.steps, step)
 
-	return step
+	return nil
 }
 
-// Ok sets the handler called when the entire flow completes successfully.
-func (f *Flow) Ok(fn StateHandler) *Flow {
-	f.okFn = fn
-	return f
+func (f *Flow) step(name string) *Step {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	return f.byName[name]
 }
 
-// Err sets the handler called when the flow fails.
-func (f *Flow) Err(fn ErrHandler) *Flow {
-	f.errFn = fn
-	return f
-}
+func (f *Flow) stepAt(i int) *Step {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
-// IsExpired checks if the flow has timed out since starting.
-func (f *Flow) IsExpired() bool {
-	if f.timeout == 0 {
-		return false
+	if i < 0 || i >= len(f.steps) {
+		return nil
 	}
-	return time.Since(f.start) > f.timeout
+
+	return f.steps[i]
+}
+
+func (f *Flow) next(name string) *Step {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	i, ok := f.positions[name]
+	if !ok || i+1 >= len(f.steps) {
+		return nil
+	}
+
+	return f.steps[i+1]
+}
+
+func (f *Flow) first() *Step {
+	return f.stepAt(0)
+}
+
+func (f *Flow) validateRuntime(state *runtimeState) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if state.FlowName != f.name || state.FlowVersion != f.version {
+		return ErrInvalidRuntimeState
+	}
+
+	if len(state.History) == 0 || len(state.History) > f.historyLimit {
+		return ErrInvalidRuntimeState
+	}
+
+	if state.History[len(state.History)-1] != state.CurrentStep {
+		return ErrInvalidRuntimeState
+	}
+
+	for _, name := range state.History {
+		if _, exists := f.byName[name]; !exists {
+			return ErrInvalidRuntimeState
+		}
+	}
+
+	return nil
 }
