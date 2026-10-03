@@ -1,18 +1,16 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"sync"
 	"time"
 )
 
-var (
-	ErrKeyNotFound = errors.New("key not found")
-)
+var ErrKeyNotFound = errors.New("key not found")
 
-// Memory stores values in process memory.
+// Memory is a concurrent, process-local Storage.
+// Its zero value is ready for use.
 type Memory struct {
 	data sync.Map
 }
@@ -25,14 +23,15 @@ type raw struct {
 	isRemoved bool
 }
 
-var _ Storage = (*Memory)(nil)
-
-// NewMemory creates in-memory storage.
+// NewMemory returns an empty, process-local Storage.
 func NewMemory() Storage {
 	return &Memory{}
 }
 
-// Get returns a copied value by key.
+// Get returns an independent copy of the value associated with key.
+//
+// It returns ErrKeyNotFound when the key is missing or expired.
+// If ctx is already done, Get returns ctx.Err without reading storage.
 func (m *Memory) Get(ctx context.Context, key string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -54,7 +53,10 @@ func (m *Memory) Get(ctx context.Context, key string) ([]byte, error) {
 	return append([]byte(nil), v.value...), nil
 }
 
-// Set stores a copy of value and applies a positive expiration.
+// Set replaces key with a copy of value.
+//
+// A positive expiration removes the value after that duration, while a zero or negative expiration keeps it until it is replaced or deleted.
+// If ctx is already done, Set returns ctx.Err without changing storage.
 func (m *Memory) Set(ctx context.Context, key string, value []byte, expiration time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -69,7 +71,9 @@ func (m *Memory) Set(ctx context.Context, key string, value []byte, expiration t
 	return nil
 }
 
-// Delete removes a value by key.
+// Delete removes key and returns nil when it is absent.
+//
+// If ctx is already done, Delete returns ctx.Err without changing storage.
 func (m *Memory) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -78,84 +82,6 @@ func (m *Memory) Delete(ctx context.Context, key string) error {
 		value.(*raw).stopTimer()
 	}
 	return nil
-}
-
-// CompareAndSwap conditionally stores a copied value.
-func (m *Memory) CompareAndSwap(
-	ctx context.Context,
-	key string,
-	expected []byte,
-	value []byte,
-	expiration time.Duration,
-) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-
-	for {
-		current, exists := m.data.Load(key)
-		if !exists {
-			if expected != nil {
-				return false, nil
-			}
-
-			next := m.newRaw(value, expiration)
-			if _, loaded := m.data.LoadOrStore(key, next); loaded {
-				continue
-			}
-			next.startTimer(m, key, expiration)
-			return true, nil
-		}
-
-		stored := current.(*raw)
-		if m.isExpired(stored) {
-			if m.data.CompareAndDelete(key, stored) {
-				stored.stopTimer()
-			}
-			continue
-		}
-		if expected == nil || !bytes.Equal(stored.value, expected) {
-			return false, nil
-		}
-
-		next := m.newRaw(value, expiration)
-		if !m.data.CompareAndSwap(key, stored, next) {
-			continue
-		}
-		next.startTimer(m, key, expiration)
-		stored.stopTimer()
-		return true, nil
-	}
-}
-
-// CompareAndDelete conditionally removes a value.
-func (m *Memory) CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-
-	for {
-		current, exists := m.data.Load(key)
-		if !exists {
-			return false, nil
-		}
-
-		stored := current.(*raw)
-		if m.isExpired(stored) {
-			if m.data.CompareAndDelete(key, stored) {
-				stored.stopTimer()
-			}
-			return false, nil
-		}
-		if !bytes.Equal(stored.value, expected) {
-			return false, nil
-		}
-		if !m.data.CompareAndDelete(key, stored) {
-			continue
-		}
-		stored.stopTimer()
-		return true, nil
-	}
 }
 
 func (m *Memory) newRaw(value []byte, expiration time.Duration) *raw {

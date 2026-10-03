@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/hellocashmere/teleflow"
@@ -15,6 +17,13 @@ import (
 const callbackID = "survey"
 
 func main() {
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -29,8 +38,13 @@ func main() {
 
 	answer := tele.Btn{Unique: callbackID}
 
-	bot.Handle(&answer, bus.Handle)
-	bot.Handle("/survey", SurveyHandler(bus))
+	bot.Handle(&answer, bus.HandleCtx(ctx))
+	bot.Handle("/survey", SurveyHandler(ctx, bus))
+
+	go func() {
+		<-ctx.Done()
+		bot.Stop()
+	}()
 
 	log.Println("telegram bot started successfully")
 	bot.Start()
@@ -38,7 +52,8 @@ func main() {
 	log.Println("telegram bot stopped")
 }
 
-func SurveyHandler(bus teleflow.Bus) tele.HandlerFunc {
+// SurveyHandler returns a command handler that builds and starts the survey flow.
+func SurveyHandler(ctx context.Context, bus teleflow.Bus) tele.HandlerFunc {
 	survey := bus.NewFlow(teleflow.FlowConfig{
 		Name:        "survey",
 		Version:     1,
@@ -162,7 +177,7 @@ func SurveyHandler(bus teleflow.Bus) tele.HandlerFunc {
 			return fmt.Errorf("build survey flow: %w", err)
 		}
 
-		return bus.Start(context.Background(), c, survey)
+		return bus.Start(ctx, c, survey)
 	}
 }
 

@@ -12,11 +12,6 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
-const (
-	operationLeaseTimeout = time.Minute
-	releaseTimeout        = 5 * time.Second
-)
-
 var (
 	ErrNameEmpty               = errors.New("flow: name cannot be empty")
 	ErrVersionInvalid          = errors.New("flow: version must be greater than zero")
@@ -31,22 +26,72 @@ var (
 	ErrContextNoSender         = errors.New("flow: context has no sender")
 	ErrInvalidStepResult       = errors.New("flow: invalid step result")
 	ErrStorageNil              = errors.New("flow: storage is nil")
-	ErrConcurrentUpdate        = errors.New("flow: state changed concurrently")
-	ErrStateBusy               = errors.New("flow: state is being processed")
 	ErrTargetStepNotFound      = errors.New("flow: target step not found")
 )
 
+// Bus registers flow definitions and processes their sessions.
+//
+// It coordinates concurrent updates only within one Bus instance.
 type Bus interface {
-	// NewFlow creates a versioned flow draft.
+	// NewFlow creates a mutable flow draft.
+	//
+	// Add steps and call Build before passing the flow to Start.
+	//
+	// Example:
+	//
+	//	flow := bus.NewFlow(FlowConfig{
+	//		Name:    "signup",
+	//		Version: 1,
+	//	})
 	NewFlow(config FlowConfig) *Flow
 
-	// Start starts a flow or resumes its pending begin callback.
+	// Start creates a session for a built flow.
+	//
+	// The flow must have been created by this Bus and successfully built.
+	// If a session already exists, Start resumes the stored session's pending begin callback and otherwise leaves it unchanged.
+	// An expired session is removed and reported as ErrExpired.
+	//
+	// Example:
+	//
+	//	if err := flow.Build(); err != nil {
+	//		log.Fatal(err)
+	//	}
+	//
+	//	bot.Handle("/signup", func(c tele.Context) error {
+	//		return bus.Start(ctx, c, flow)
+	//	})
 	Start(ctx context.Context, c tele.Context, flow *Flow) error
 
-	// Handle processes an inferred Telebot event.
+	// Handle processes an update for an active session using context.Background.
+	//
+	// Register it for every Telebot event used by the flow.
+	// Updates without an active session or a matching current-step event are ignored.
+	//
+	// Example:
+	//
+	//	bot.Handle(tele.OnText, bus.Handle)
 	Handle(c tele.Context) error
 
-	// Cancel removes the active flow for the current chat and sender.
+	// HandleCtx returns a Telebot handler that uses ctx for every update.
+	//
+	// Register the returned handler for every Telebot event used by the flow.
+	//
+	// Example:
+	//
+	//	handler := bus.HandleCtx(ctx)
+	//	bot.Handle(tele.OnText, handler)
+	//	bot.Handle(tele.OnCallback, handler)
+	HandleCtx(ctx context.Context) tele.HandlerFunc
+
+	// Cancel removes the active session identified by the Telebot context.
+	//
+	// It succeeds when no session exists.
+	//
+	// Example:
+	//
+	//	bot.Handle("/cancel", func(c tele.Context) error {
+	//		return bus.Cancel(ctx, c)
+	//	})
 	Cancel(ctx context.Context, c tele.Context) error
 }
 
@@ -65,7 +110,12 @@ type keyedLock struct {
 	refs int
 }
 
-// NewBus creates [bus].
+// NewBus creates a flow bus backed by store.
+//
+// A nil store is accepted, but session operations then return ErrStorageNil.
+//
+// The bus serializes updates for each session within this Bus instance.
+// Other Bus instances are not coordinated, even when they share a store.
 func NewBus(store storage.Storage) Bus {
 	return &bus{
 		store:     store,
@@ -75,7 +125,9 @@ func NewBus(store storage.Storage) Bus {
 	}
 }
 
-// NewFlow returns a mutable flow draft. Build validates and registers it.
+// NewFlow returns a mutable flow draft.
+//
+// Call Build to validate and register it before starting a session.
 func (b *bus) NewFlow(cfg FlowConfig) *Flow {
 	return &Flow{
 		owner:        b,
@@ -105,7 +157,10 @@ func (b *bus) register(f *Flow) error {
 	return nil
 }
 
-// Start starts a flow or resumes its pending begin callback.
+// Start creates a session for a flow created and built by this Bus.
+//
+// If a session already exists, Start retries the stored session's pending begin callback and otherwise leaves it unchanged.
+// An expired session is removed and reported as ErrExpired.
 func (b *bus) Start(ctx context.Context, c tele.Context, f *Flow) error {
 	if b.store == nil {
 		return ErrStorageNil
@@ -131,45 +186,36 @@ func (b *bus) Start(ctx context.Context, c tele.Context, f *Flow) error {
 	unlock := b.lockFor(key)
 	defer unlock()
 
-	for attempt := 0; attempt < 2; attempt++ {
-		stored, getErr := b.store.Get(ctx, key)
-		if getErr == nil {
-			return b.startStored(ctx, key, c, stored)
-		}
-
-		if !errors.Is(getErr, storage.ErrKeyNotFound) {
-			return fmt.Errorf("flow: get stored state: %w", getErr)
-		}
-
-		now := b.currentTime()
-		first := f.first()
-		if first == nil {
-			return ErrNoStepsDefined
-		}
-
-		state := &runtimeState{
-			FlowName:     f.name,
-			FlowVersion:  f.version,
-			CurrentStep:  first.name,
-			History:      []string{first.name},
-			StartedAt:    now,
-			LastActivity: now,
-			PendingBegin: true,
-		}
-
-		created, persistErr := b.persist(ctx, key, nil, state, f.idleTimeout)
-		if errors.Is(persistErr, ErrConcurrentUpdate) {
-			continue
-		}
-
-		if persistErr != nil {
-			return fmt.Errorf("flow: failed to set state: %w", persistErr)
-		}
-
-		return b.resumeBegin(ctx, key, c, state, f, created)
+	stored, getErr := b.store.Get(ctx, key)
+	if getErr == nil {
+		return b.startStored(ctx, key, c, stored)
 	}
 
-	return ErrConcurrentUpdate
+	if !errors.Is(getErr, storage.ErrKeyNotFound) {
+		return fmt.Errorf("flow: get stored state: %w", getErr)
+	}
+
+	now := b.currentTime()
+	first := f.first()
+	if first == nil {
+		return ErrNoStepsDefined
+	}
+
+	state := &runtimeState{
+		FlowName:     f.name,
+		FlowVersion:  f.version,
+		CurrentStep:  first.name,
+		History:      []string{first.name},
+		StartedAt:    now,
+		LastActivity: now,
+		PendingBegin: true,
+	}
+
+	if err := b.persist(ctx, key, state, f.idleTimeout); err != nil {
+		return fmt.Errorf("flow: failed to set state: %w", err)
+	}
+
+	return b.resumeBegin(ctx, key, c, state, f)
 }
 
 func (b *bus) startStored(ctx context.Context, key string, c tele.Context, stored []byte) error {
@@ -184,7 +230,7 @@ func (b *bus) startStored(ctx context.Context, key string, c tele.Context, store
 	}
 
 	if b.expired(state, f) {
-		if err = b.delete(ctx, key, stored); err != nil {
+		if err = b.store.Delete(ctx, key); err != nil {
 			return fmt.Errorf("flow: delete expired state: %w", err)
 		}
 
@@ -192,19 +238,31 @@ func (b *bus) startStored(ctx context.Context, key string, c tele.Context, store
 	}
 
 	if state.PendingBegin {
-		return b.resumeBegin(ctx, key, c, state, f, stored)
+		return b.resumeBegin(ctx, key, c, state, f)
 	}
 
 	return nil
 }
 
-// Handle dispatches an inferred Telebot event.
+// Handle dispatches an inferred Telebot event with a background context.
+//
+// Use HandleCtx when storage operations and step callbacks must observe cancellation or deadlines.
 func (b *bus) Handle(c tele.Context) error {
+	return b.handle(context.Background(), c)
+}
+
+// HandleCtx returns a Telebot handler that uses ctx for every update.
+func (b *bus) HandleCtx(ctx context.Context) tele.HandlerFunc {
+	return func(c tele.Context) error {
+		return b.handle(ctx, c)
+	}
+}
+
+func (b *bus) handle(ctx context.Context, c tele.Context) error {
 	if b.store == nil {
 		return ErrStorageNil
 	}
 
-	ctx := context.Background()
 	event := b.getEventType(c)
 
 	key, err := sessionKey(c)
@@ -235,7 +293,7 @@ func (b *bus) Handle(c tele.Context) error {
 	}
 
 	if b.expired(state, f) {
-		if deleteErr := b.delete(ctx, key, v); deleteErr != nil {
+		if deleteErr := b.store.Delete(ctx, key); deleteErr != nil {
 			return fmt.Errorf("flow: delete expired state: %w", deleteErr)
 		}
 
@@ -243,7 +301,7 @@ func (b *bus) Handle(c tele.Context) error {
 	}
 
 	if state.PendingBegin {
-		return b.resumeBegin(ctx, key, c, state, f, v)
+		return b.resumeBegin(ctx, key, c, state, f)
 	}
 
 	if updateID := c.Update().ID; updateID > 0 && updateID <= state.LastUpdateID {
@@ -259,12 +317,7 @@ func (b *bus) Handle(c tele.Context) error {
 		return nil
 	}
 
-	claimed, claimedValue, err := b.claim(ctx, key, v, state, f.idleTimeout)
-	if err != nil {
-		return err
-	}
-
-	working := cloneRuntime(claimed)
+	working := cloneRuntime(state)
 	fc := &nativeContext{
 		state:   working,
 		current: working.CurrentStep,
@@ -274,47 +327,39 @@ func (b *bus) Handle(c tele.Context) error {
 
 	var result StepResult
 	if step.handle != nil {
-		callbackCtx, cancel := leaseContext(ctx, claimed.LeaseUntil)
-		result, err = step.handle(callbackCtx, c, fc)
-		cancel()
+		result, err = step.handle(ctx, c, fc)
 	}
 	if err != nil {
-		releaseErr := b.release(ctx, key, claimedValue, claimed, f.idleTimeout)
-
-		return errors.Join(fmt.Errorf("flow: step %q: %w", state.CurrentStep, err), releaseErr)
+		return fmt.Errorf("flow: step %q: %w", state.CurrentStep, err)
 	}
 
 	state = working
 	state.LastActivity = b.currentTime()
 	state.LastUpdateID = c.Update().ID
-	state.LeaseUntil = time.Time{}
 
 	switch result {
 	case stepStay:
-		_, err = b.persist(ctx, key, claimedValue, state, f.idleTimeout)
-		return err
+		return b.persist(ctx, key, state, f.idleTimeout)
 	case stepBack:
 		if len(state.History) <= 1 {
-			_, err = b.persist(ctx, key, claimedValue, state, f.idleTimeout)
-			return err
+			return b.persist(ctx, key, state, f.idleTimeout)
 		}
 
 		state.History = state.History[:len(state.History)-1]
 		state.CurrentStep = state.History[len(state.History)-1]
 		state.PendingBegin = true
 
-		pending, persistErr := b.persist(ctx, key, claimedValue, state, f.idleTimeout)
-		if persistErr != nil {
-			return persistErr
+		if err := b.persist(ctx, key, state, f.idleTimeout); err != nil {
+			return err
 		}
-		if err := b.resumeBegin(ctx, key, c, state, f, pending); err != nil {
+		if err := b.resumeBegin(ctx, key, c, state, f); err != nil {
 			return err
 		}
 		return nil
 	case stepNext:
 		next := f.next(state.CurrentStep)
 		if next == nil {
-			if err := b.delete(ctx, key, claimedValue); err != nil {
+			if err := b.store.Delete(ctx, key); err != nil {
 				return fmt.Errorf("flow: delete completed state: %w", err)
 			}
 			return nil
@@ -324,38 +369,31 @@ func (b *bus) Handle(c tele.Context) error {
 		state.History = appendBounded(state.History, next.name, f.historyLimit)
 		state.PendingBegin = true
 
-		pending, persistErr := b.persist(ctx, key, claimedValue, state, f.idleTimeout)
-		if persistErr != nil {
-			return persistErr
+		if err := b.persist(ctx, key, state, f.idleTimeout); err != nil {
+			return err
 		}
-		return b.resumeBegin(ctx, key, c, state, f, pending)
+		return b.resumeBegin(ctx, key, c, state, f)
 	case stepGo:
 		target := f.step(fc.target)
 		if target == nil {
-			releaseErr := b.release(ctx, key, claimedValue, claimed, f.idleTimeout)
-
-			return errors.Join(
-				fmt.Errorf("%w: %q", ErrTargetStepNotFound, fc.target),
-				releaseErr,
-			)
+			return fmt.Errorf("%w: %q", ErrTargetStepNotFound, fc.target)
 		}
 
 		state.CurrentStep = target.name
 		state.History = appendBounded(state.History, target.name, f.historyLimit)
 		state.PendingBegin = true
 
-		pending, persistErr := b.persist(ctx, key, claimedValue, state, f.idleTimeout)
-		if persistErr != nil {
-			return persistErr
+		if err := b.persist(ctx, key, state, f.idleTimeout); err != nil {
+			return err
 		}
 
-		return b.resumeBegin(ctx, key, c, state, f, pending)
+		return b.resumeBegin(ctx, key, c, state, f)
 	default:
-		releaseErr := b.release(ctx, key, claimedValue, claimed, f.idleTimeout)
-		return errors.Join(fmt.Errorf("%w: %d", ErrInvalidStepResult, result), releaseErr)
+		return fmt.Errorf("%w: %d", ErrInvalidStepResult, result)
 	}
 }
 
+// Cancel removes the active session identified by the Telebot context.
 func (b *bus) Cancel(ctx context.Context, c tele.Context) error {
 	if b.store == nil {
 		return ErrStorageNil
@@ -369,16 +407,7 @@ func (b *bus) Cancel(ctx context.Context, c tele.Context) error {
 	unlock := b.lockFor(key)
 	defer unlock()
 
-	stored, err := b.store.Get(ctx, key)
-	if errors.Is(err, storage.ErrKeyNotFound) {
-		return nil
-	}
-
-	if err != nil {
-		return fmt.Errorf("flow: cancel: %w", err)
-	}
-
-	if err := b.delete(ctx, key, stored); err != nil {
+	if err := b.store.Delete(ctx, key); err != nil {
 		return fmt.Errorf("flow: cancel: %w", err)
 	}
 
@@ -391,37 +420,24 @@ func (b *bus) resumeBegin(
 	c tele.Context,
 	state *runtimeState,
 	f *Flow,
-	stored []byte,
 ) error {
-	claimed, claimedValue, err := b.claim(ctx, key, stored, state, f.idleTimeout)
-	if err != nil {
-		return err
-	}
-
-	step := f.step(claimed.CurrentStep)
+	step := f.step(state.CurrentStep)
 	if step == nil {
-		releaseErr := b.release(ctx, key, claimedValue, claimed, f.idleTimeout)
-
-		return errors.Join(fmt.Errorf("flow: step %q not found", claimed.CurrentStep), releaseErr)
+		return fmt.Errorf("flow: step %q not found", state.CurrentStep)
 	}
 
 	if step.begin != nil {
-		callbackCtx, cancel := leaseContext(ctx, claimed.LeaseUntil)
-		err := step.begin(callbackCtx, c)
-		cancel()
+		err := step.begin(ctx, c)
 		if err != nil {
-			releaseErr := b.release(ctx, key, claimedValue, claimed, f.idleTimeout)
-
-			return errors.Join(fmt.Errorf("flow: begin step %q: %w", claimed.CurrentStep, err), releaseErr)
+			return fmt.Errorf("flow: begin step %q: %w", state.CurrentStep, err)
 		}
 	}
 
-	claimed.PendingBegin = false
-	claimed.LastActivity = b.currentTime()
-	claimed.LeaseUntil = time.Time{}
+	state.PendingBegin = false
+	state.LastActivity = b.currentTime()
 
-	if _, err := b.persist(ctx, key, claimedValue, claimed, f.idleTimeout); err != nil {
-		return fmt.Errorf("flow: persist entered step %q: %w", claimed.CurrentStep, err)
+	if err := b.persist(ctx, key, state, f.idleTimeout); err != nil {
+		return fmt.Errorf("flow: persist entered step %q: %w", state.CurrentStep, err)
 	}
 
 	return nil
@@ -447,88 +463,16 @@ func (b *bus) definitionFor(state *runtimeState) (*Flow, error) {
 func (b *bus) persist(
 	ctx context.Context,
 	key string,
-	expected []byte,
-	state *runtimeState,
-	expiration time.Duration,
-) ([]byte, error) {
-	value, err := encodeRuntime(state)
-	if err != nil {
-		return nil, err
-	}
-
-	swapped, swapErr := b.store.CompareAndSwap(ctx, key, expected, value, expiration)
-	if swapErr != nil {
-		return nil, fmt.Errorf("flow: compare and swap state: %w", swapErr)
-	}
-
-	if !swapped {
-		return nil, ErrConcurrentUpdate
-	}
-
-	return value, nil
-}
-
-func (b *bus) claim(
-	ctx context.Context,
-	key string,
-	expected []byte,
-	state *runtimeState,
-	expiration time.Duration,
-) (*runtimeState, []byte, error) {
-	if state.LeaseUntil.After(b.currentTime()) {
-		return nil, nil, ErrStateBusy
-	}
-
-	if state.Revision == ^uint64(0) {
-		return nil, nil, ErrInvalidRuntimeState
-	}
-
-	claimed := cloneRuntime(state)
-	claimed.Revision++
-	claimed.LeaseUntil = b.currentTime().Add(operationLeaseTimeout)
-
-	claimExpiration := expiration
-	if claimExpiration < operationLeaseTimeout {
-		claimExpiration = operationLeaseTimeout
-	}
-
-	value, err := b.persist(ctx, key, expected, claimed, claimExpiration)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return claimed, value, nil
-}
-
-func (b *bus) release(
-	ctx context.Context,
-	key string,
-	expected []byte,
 	state *runtimeState,
 	expiration time.Duration,
 ) error {
-	released := cloneRuntime(state)
-	released.LeaseUntil = time.Time{}
-
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-	defer cancel()
-
-	_, err := b.persist(releaseCtx, key, expected, released, expiration)
-	if errors.Is(err, ErrConcurrentUpdate) {
-		return nil
-	}
-
-	return err
-}
-
-func (b *bus) delete(ctx context.Context, key string, expected []byte) error {
-	deleted, err := b.store.CompareAndDelete(ctx, key, expected)
+	value, err := encodeRuntime(state)
 	if err != nil {
-		return fmt.Errorf("flow: compare and delete state: %w", err)
+		return err
 	}
 
-	if !deleted {
-		return ErrConcurrentUpdate
+	if err := b.store.Set(ctx, key, value, expiration); err != nil {
+		return fmt.Errorf("flow: set state: %w", err)
 	}
 
 	return nil
@@ -665,10 +609,6 @@ func (b *bus) lookup(n string, v uint) *Flow {
 
 func (b *bus) expired(rs *runtimeState, f *Flow) bool {
 	now := b.currentTime()
-	if rs.LeaseUntil.After(now) {
-		return false
-	}
-
 	return !rs.LastActivity.IsZero() && !now.Before(rs.LastActivity.Add(f.idleTimeout))
 }
 
@@ -680,6 +620,8 @@ func (b *bus) currentTime() time.Time {
 	return time.Now()
 }
 
+// sessionKey identifies a session by sender and, when available, chat and message thread.
+// It returns ErrContextNoSender when the context or sender is missing.
 func sessionKey(c tele.Context) (string, error) {
 	if c == nil || c.Sender() == nil {
 		return "", ErrContextNoSender
@@ -709,14 +651,6 @@ func appendBounded(h []string, id string, limit int) []string {
 	}
 
 	return h
-}
-
-func leaseContext(ctx context.Context, until time.Time) (context.Context, context.CancelFunc) {
-	if until.IsZero() {
-		return context.WithCancel(ctx)
-	}
-
-	return context.WithDeadline(ctx, until)
 }
 
 func defKey(n string, v uint) string {

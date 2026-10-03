@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/hellocashmere/teleflow"
@@ -16,6 +18,13 @@ import (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -40,8 +49,13 @@ func main() {
 		"An internal error occurred while creating the payment. Please try again later.",
 	))
 
-	bot.Handle(tele.OnText, bus.Handle)
-	bot.Handle("/payment", PaymentHandler(bus))
+	bot.Handle(tele.OnText, bus.HandleCtx(ctx))
+	bot.Handle("/payment", PaymentHandler(ctx, bus))
+
+	go func() {
+		<-ctx.Done()
+		bot.Stop()
+	}()
 
 	log.Println("telegram bot started successfully")
 	bot.Start()
@@ -49,7 +63,8 @@ func main() {
 	log.Println("telegram bot stopped")
 }
 
-func PaymentHandler(bus teleflow.Bus) tele.HandlerFunc {
+// PaymentHandler returns a command handler that builds and starts the payment flow.
+func PaymentHandler(ctx context.Context, bus teleflow.Bus) tele.HandlerFunc {
 	payment := bus.NewFlow(teleflow.FlowConfig{
 		Name:        "payment",
 		Version:     1,
@@ -88,10 +103,12 @@ func PaymentHandler(bus teleflow.Bus) tele.HandlerFunc {
 			return fmt.Errorf("build payment flow: %w", err)
 		}
 
-		return bus.Start(context.Background(), c, payment)
+		return bus.Start(ctx, c, payment)
 	}
 }
 
+// HandleErrors reports handler failures to the user and preserves the original error.
+// If sending the report also fails, the middleware returns both errors.
 func HandleErrors(message string) tele.MiddlewareFunc {
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {

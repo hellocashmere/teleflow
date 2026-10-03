@@ -14,11 +14,15 @@ var (
 	ErrInvalidValue = errors.New("flow: invalid value")
 )
 
+// Context exposes session data and transition operations during one step handler call.
+//
+// Data changes are persisted only after the handler returns a valid transition without an error and the state write succeeds.
+// Setters and Delete return ErrDataKeyEmpty when given an empty key.
 type Context interface {
-	// SetString stores a string value under the key.
+	// SetString stores a string under the key.
 	SetString(string, string) error
 
-	// SetBool stores a boolean value under the key.
+	// SetBool stores a boolean under the key.
 	SetBool(string, bool) error
 
 	// SetInt stores an int value normalized to int64.
@@ -27,76 +31,81 @@ type Context interface {
 	// SetInt32 stores an int32 value normalized to int64.
 	SetInt32(string, int32) error
 
-	// SetInt64 stores an int64 value under the key.
+	// SetInt64 stores an int64 under the key.
 	SetInt64(string, int64) error
 
 	// SetFloat32 stores a finite float32 value normalized to float64.
 	SetFloat32(string, float32) error
 
-	// SetFloat64 stores a finite float64 value under the key.
+	// SetFloat64 stores a finite float64 under the key.
 	SetFloat64(string, float64) error
 
 	// SetDuration stores a time.Duration as an int64 nanosecond count.
 	SetDuration(string, time.Duration) error
 
-	// SetTime stores a time.Time as an RFC3339Nano string.
+	// SetTime stores a time.Time in RFC3339Nano format.
 	SetTime(string, time.Time) error
 
 	// Delete removes the value stored under the key.
+	// It returns ErrDataKeyEmpty for an empty key and succeeds when the key is absent.
 	Delete(string) error
 
 	// Has reports whether the key exists in the current flow data.
 	Has(string) bool
 
-	// GetString returns the string value stored under the key.
+	// GetString returns the stored string and reports whether the key exists with that type.
 	GetString(string) (string, bool)
 
-	// GetBool returns the boolean value stored under the key.
+	// GetBool returns the stored boolean and reports whether the key exists with that type.
 	GetBool(string) (bool, bool)
 
-	// GetInt returns the stored integer when it fits in an int.
+	// GetInt returns the stored integer and reports whether it exists and fits in an int.
 	GetInt(string) (int, bool)
 
-	// GetInt32 returns the stored integer when it fits in an int32.
+	// GetInt32 returns the stored integer and reports whether it exists and fits in an int32.
 	GetInt32(string) (int32, bool)
 
-	// GetInt64 returns the stored int64 value.
+	// GetInt64 returns the stored int64 and reports whether the key exists with that type.
 	GetInt64(string) (int64, bool)
 
-	// GetFloat32 returns the stored floating-point value when it fits in a float32.
+	// GetFloat32 returns the stored number and reports whether it exists and converts without overflow or underflow.
 	GetFloat32(string) (float32, bool)
 
-	// GetFloat64 returns the stored float64 value.
+	// GetFloat64 returns the stored float64 and reports whether the key exists with that type.
 	GetFloat64(string) (float64, bool)
 
-	// GetDuration returns the stored duration.
+	// GetDuration returns the stored duration and reports whether the key exists with that type.
 	GetDuration(string) (time.Duration, bool)
 
-	// GetTime returns the stored time.Time value.
+	// GetTime returns the stored time and reports whether the key contains a valid RFC3339Nano value.
 	GetTime(string) (time.Time, bool)
 
-	// Current returns the name of the current step.
+	// Current returns the step whose handler is running.
 	Current() string
 
-	// Depth returns the number of step entries currently present in history.
+	// Depth returns the number of retained history entries at the start of the handler call.
 	Depth() int
 
-	// CanBack reports whether the flow can move to a previous step.
+	// CanBack reports whether a previous history entry existed at the start of the handler call.
 	CanBack() bool
 
-	// Step returns the name of the currently active step.
+	// Step returns the active step recorded in the working session state.
 	Step() string
 
-	// Next advances the flow to the next defined step after the handler returns.
+	// Next requests the next defined step.
+	// On the last step, successful handling completes the flow and removes the session state.
 	Next() StepResult
 
-	// Back moves the flow to the previous step when history allows it.
+	// Back requests the previous retained history entry.
+	// At the first retained entry, the flow stays on the current step.
 	Back() StepResult
 
-	// Go moves the flow to the named step after the handler returns.
+	// Go requests the named step.
+	// Handling returns ErrTargetStepNotFound when the flow has no step with that name.
 	Go(string) StepResult
 
-	// Stay keeps the flow on the current step after the handler returns.
+	// Stay requests no step change.
+	// Successful handling persists any data changes.
 	Stay() StepResult
 }
 
