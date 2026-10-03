@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -136,13 +135,6 @@ func TestStart(t *testing.T) {
 				if state.PendingBegin {
 					t.Fatal("pending begin = true, want false")
 				}
-				if !state.LeaseUntil.IsZero() {
-					t.Fatalf("lease until = %v, want zero", state.LeaseUntil)
-				}
-				if state.Revision != 1 {
-					t.Fatalf("revision = %d, want 1", state.Revision)
-				}
-
 				if err := bus.Start(t.Context(), ctx, flow); err != nil {
 					t.Fatalf("second Start() error = %v", err)
 				}
@@ -288,10 +280,6 @@ func TestStartRetriesPendingBegin(t *testing.T) {
 				if !failedState.PendingBegin {
 					t.Fatal("pending begin after error = false, want true")
 				}
-				if !failedState.LeaseUntil.IsZero() {
-					t.Fatalf("lease after error = %v, want zero", failedState.LeaseUntil)
-				}
-
 				if err := bus.Start(t.Context(), ctx, flow); err != nil {
 					t.Fatalf("second Start() error = %v", err)
 				}
@@ -311,13 +299,13 @@ func TestStartRetriesPendingBegin(t *testing.T) {
 	}
 }
 
-func TestStartCanceledBeginReleasesLease(t *testing.T) {
+func TestStartCanceledBeginRemainsPending(t *testing.T) {
 	tests := []struct {
 		name string
 		test func(t *testing.T)
 	}{
 		{
-			name: "start_canceled_begin_releases_lease",
+			name: "start_canceled_begin_remains_pending",
 			test: func(t *testing.T) {
 				t.Parallel()
 
@@ -347,9 +335,6 @@ func TestStartCanceledBeginReleasesLease(t *testing.T) {
 					t.Fatalf("Start() error = %v, want %v", err, context.Canceled)
 				}
 				state := loadRuntimeForTest(t, store, teleCtx)
-				if !state.LeaseUntil.IsZero() {
-					t.Fatalf("lease after cancellation = %v, want zero", state.LeaseUntil)
-				}
 				if !state.PendingBegin {
 					t.Fatal("pending begin after cancellation = false, want true")
 				}
@@ -666,9 +651,6 @@ func TestHandleGoRejectsUnknownStep(t *testing.T) {
 				if state.CurrentStep != "name" {
 					t.Fatalf("current step = %q, want %q", state.CurrentStep, "name")
 				}
-				if !state.LeaseUntil.IsZero() {
-					t.Fatalf("lease after rejected target = %v, want zero", state.LeaseUntil)
-				}
 				if state.LastUpdateID != 0 {
 					t.Fatalf("last update ID = %d, want 0", state.LastUpdateID)
 				}
@@ -903,13 +885,13 @@ func TestHandleIgnoresDuplicateUpdate(t *testing.T) {
 	}
 }
 
-func TestHandleErrorReleasesLease(t *testing.T) {
+func TestHandleErrorDoesNotPersistCallbackState(t *testing.T) {
 	tests := []struct {
 		name string
 		test func(t *testing.T)
 	}{
 		{
-			name: "handle_error_releases_lease",
+			name: "handle_error_does_not_persist_callback_state",
 			test: func(t *testing.T) {
 				t.Parallel()
 
@@ -943,9 +925,6 @@ func TestHandleErrorReleasesLease(t *testing.T) {
 					t.Fatalf("Handle() error = %v, want %v", err, callbackErr)
 				}
 				state := loadRuntimeForTest(t, store, ctx)
-				if !state.LeaseUntil.IsZero() {
-					t.Fatalf("lease until = %v, want zero", state.LeaseUntil)
-				}
 				if _, exists := state.Data["name"]; exists {
 					t.Fatal("callback data was persisted after error")
 				}
@@ -961,13 +940,13 @@ func TestHandleErrorReleasesLease(t *testing.T) {
 	}
 }
 
-func TestHandleInvalidResultReleasesLease(t *testing.T) {
+func TestHandleInvalidResultDoesNotPersistState(t *testing.T) {
 	tests := []struct {
 		name string
 		test func(t *testing.T)
 	}{
 		{
-			name: "handle_invalid_result_releases_lease",
+			name: "handle_invalid_result_does_not_persist_state",
 			test: func(t *testing.T) {
 				t.Parallel()
 
@@ -997,8 +976,8 @@ func TestHandleInvalidResultReleasesLease(t *testing.T) {
 					t.Fatalf("Handle() error = %v, want %v", err, ErrInvalidStepResult)
 				}
 				state := loadRuntimeForTest(t, store, ctx)
-				if !state.LeaseUntil.IsZero() {
-					t.Fatalf("lease until = %v, want zero", state.LeaseUntil)
+				if state.LastUpdateID != 0 {
+					t.Fatalf("last update ID = %d, want 0", state.LastUpdateID)
 				}
 			},
 		},
@@ -1053,158 +1032,62 @@ func TestHandleExpiredState(t *testing.T) {
 	}
 }
 
-func TestHandleLiveLeaseReturnsStateBusy(t *testing.T) {
+func TestHandleSerializesSameSession(t *testing.T) {
 	tests := []struct {
 		name string
 		test func(t *testing.T)
 	}{
 		{
-			name: "handle_live_lease_returns_state_busy",
-			test: func(t *testing.T) {
-				t.Parallel()
-
-				store := storage.NewMemory()
-				bus := NewBus(store).(*bus)
-				now := time.Now()
-				bus.now = func() time.Time {
-					return now
-				}
-				ctx := textContextForTest(1, 10, 20, 0, "start")
-				flow := bus.NewFlow(FlowConfig{
-					Name:    "signup",
-					Version: 1,
-				})
-				flow.StepContext("name", tele.OnText, nil, stayHandler)
-				if err := flow.Build(); err != nil {
-					t.Fatalf("Build() error = %v", err)
-				}
-				if err := bus.Start(t.Context(), ctx, flow); err != nil {
-					t.Fatalf("Start() error = %v", err)
-				}
-
-				state := loadRuntimeForTest(t, store, ctx)
-				state.LeaseUntil = now.Add(time.Minute)
-				storeRuntimeForTest(t, store, ctx, state)
-
-				if err := bus.Handle(textContextForTest(2, 10, 20, 0, "name")); !errors.Is(err, ErrStateBusy) {
-					t.Fatalf("Handle() error = %v, want %v", err, ErrStateBusy)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, tt.test)
-	}
-}
-
-func TestHandleRejectsRevisionOverflow(t *testing.T) {
-	tests := []struct {
-		name string
-		test func(t *testing.T)
-	}{
-		{
-			name: "handle_rejects_revision_overflow",
+			name: "handle_serializes_same_session",
 			test: func(t *testing.T) {
 				t.Parallel()
 
 				store := storage.NewMemory()
 				bus := NewBus(store)
-				ctx := textContextForTest(1, 10, 20, 0, "start")
-				flow := bus.NewFlow(FlowConfig{
-					Name:    "signup",
-					Version: 1,
-				})
-				flow.StepContext("name", tele.OnText, nil, stayHandler)
-				if err := flow.Build(); err != nil {
-					t.Fatalf("Build() error = %v", err)
-				}
-				if err := bus.Start(t.Context(), ctx, flow); err != nil {
-					t.Fatalf("Start() error = %v", err)
-				}
-
-				state := loadRuntimeForTest(t, store, ctx)
-				state.Revision = math.MaxUint64
-				storeRuntimeForTest(t, store, ctx, state)
-
-				if err := bus.Handle(textContextForTest(2, 10, 20, 0, "name")); !errors.Is(err, ErrInvalidRuntimeState) {
-					t.Fatalf("Handle() error = %v, want %v", err, ErrInvalidRuntimeState)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, tt.test)
-	}
-}
-
-func TestHandleTwoBusesProcessUpdateOnce(t *testing.T) {
-	tests := []struct {
-		name string
-		test func(t *testing.T)
-	}{
-		{
-			name: "handle_two_buses_process_update_once",
-			test: func(t *testing.T) {
-				t.Parallel()
-
-				store := storage.NewMemory()
-				firstBus := NewBus(store)
-				secondBus := NewBus(store)
 				started := make(chan struct{})
 				release := make(chan struct{})
 				var handleCalls atomic.Int32
 
-				newFlow := func(bus Bus) *Flow {
-					flow := bus.NewFlow(FlowConfig{
-						Name:    "signup",
-						Version: 1,
-					})
-					flow.StepContext(
-						"name",
-						tele.OnText,
-						nil,
-						func(ctx context.Context, c tele.Context, fc Context) (StepResult, error) {
-							if handleCalls.Add(1) == 1 {
-								close(started)
-								<-release
-							}
-							return fc.Stay(), nil
-						},
-					)
-					if err := flow.Build(); err != nil {
-						t.Fatalf("Build() error = %v", err)
-					}
-					return flow
+				flow := bus.NewFlow(FlowConfig{
+					Name:    "signup",
+					Version: 1,
+				})
+				flow.StepContext(
+					"name",
+					tele.OnText,
+					nil,
+					func(ctx context.Context, c tele.Context, fc Context) (StepResult, error) {
+						if handleCalls.Add(1) == 1 {
+							close(started)
+							<-release
+						}
+						return fc.Stay(), nil
+					},
+				)
+				if err := flow.Build(); err != nil {
+					t.Fatalf("Build() error = %v", err)
 				}
 
-				firstFlow := newFlow(firstBus)
-				newFlow(secondBus)
 				startCtx := textContextForTest(1, 10, 20, 0, "start")
-				if err := firstBus.Start(t.Context(), startCtx, firstFlow); err != nil {
+				if err := bus.Start(t.Context(), startCtx, flow); err != nil {
 					t.Fatalf("Start() error = %v", err)
 				}
 
 				updateCtx := textContextForTest(2, 10, 20, 0, "name")
-				firstResult := make(chan error, 1)
+				results := make(chan error, 2)
 				go func() {
-					firstResult <- firstBus.Handle(updateCtx)
+					results <- bus.Handle(updateCtx)
 				}()
 				<-started
 
-				secondErr := secondBus.Handle(updateCtx)
+				go func() {
+					results <- bus.Handle(updateCtx)
+				}()
 				close(release)
-				firstErr := <-firstResult
-
-				if !errors.Is(secondErr, ErrStateBusy) {
-					t.Fatalf("second Handle() error = %v, want %v", secondErr, ErrStateBusy)
-				}
-				if firstErr != nil {
-					t.Fatalf("first Handle() error = %v", firstErr)
-				}
-				if err := secondBus.Handle(updateCtx); err != nil {
-					t.Fatalf("duplicate Handle() error = %v", err)
+				for range 2 {
+					if err := <-results; err != nil {
+						t.Fatalf("Handle() error = %v", err)
+					}
 				}
 				if got := handleCalls.Load(); got != 1 {
 					t.Fatalf("handle calls = %d, want 1", got)
@@ -1342,14 +1225,12 @@ func TestHandleIsolatesConcurrentUsers(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		users    int
-		replicas int
+		name  string
+		users int
 	}{
 		{
-			name:     "shared_memory_across_four_replicas",
-			users:    128,
-			replicas: 4,
+			name:  "concurrent_users_on_one_bus",
+			users: 128,
 		},
 	}
 
@@ -1358,13 +1239,8 @@ func TestHandleIsolatesConcurrentUsers(t *testing.T) {
 			t.Parallel()
 
 			store := storage.NewMemory()
-			buses := make([]Bus, tt.replicas)
-			flows := make([]*Flow, tt.replicas)
-
-			for i := range tt.replicas {
-				buses[i] = NewBus(store)
-				flows[i] = newIsolationFlowForTest(t, buses[i])
-			}
+			bus := NewBus(store)
+			flow := newIsolationFlowForTest(t, bus)
 
 			start := make(chan struct{})
 			errCh := make(chan error, tt.users)
@@ -1377,15 +1253,14 @@ func TestHandleIsolatesConcurrentUsers(t *testing.T) {
 					<-start
 
 					userID := int64(i + 1)
-					busIndex := i % tt.replicas
 					startCtx := textContextForTest(1, userID, 100, 0, "start")
 					updateCtx := textContextForTest(2, userID, 100, 0, fmt.Sprintf("user_%d", userID))
 
-					if err := buses[busIndex].Start(t.Context(), startCtx, flows[busIndex]); err != nil {
+					if err := bus.Start(t.Context(), startCtx, flow); err != nil {
 						errCh <- fmt.Errorf("user %d start: %w", userID, err)
 						return
 					}
-					if err := buses[busIndex].Handle(updateCtx); err != nil {
+					if err := bus.Handle(updateCtx); err != nil {
 						errCh <- fmt.Errorf("user %d handle: %w", userID, err)
 					}
 				}()
@@ -1406,7 +1281,6 @@ func TestHandleIsolatesConcurrentUsers(t *testing.T) {
 
 			for i := range tt.users {
 				userID := int64(i + 1)
-				busIndex := i % tt.replicas
 				ctx := textContextForTest(2, userID, 100, 0, fmt.Sprintf("user_%d", userID))
 				state := loadRuntimeForTest(t, store, ctx)
 				want := fmt.Sprintf(`"user_%d"`, userID)
@@ -1415,11 +1289,53 @@ func TestHandleIsolatesConcurrentUsers(t *testing.T) {
 					t.Fatalf("user %d answer = %s, want %s", userID, got, want)
 				}
 
-				if err := buses[busIndex].Cancel(t.Context(), ctx); err != nil {
+				if err := bus.Cancel(t.Context(), ctx); err != nil {
 					t.Fatalf("user %d Cancel() error = %v", userID, err)
 				}
 			}
 		})
+	}
+}
+
+func TestHandleCtxPropagatesContext(t *testing.T) {
+	t.Parallel()
+
+	type contextKey struct{}
+
+	const wantValue = "handler context"
+
+	store := storage.NewMemory()
+	bus := NewBus(store)
+	flow := bus.NewFlow(FlowConfig{
+		Name:    "signup",
+		Version: 1,
+	})
+
+	var gotValue any
+	flow.StepContext(
+		"name",
+		tele.OnText,
+		nil,
+		func(ctx context.Context, c tele.Context, fc Context) (StepResult, error) {
+			gotValue = ctx.Value(contextKey{})
+			return fc.Stay(), nil
+		},
+	)
+	if err := flow.Build(); err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	teleCtx := textContextForTest(1, 10, 20, 0, "start")
+	if err := bus.Start(t.Context(), teleCtx, flow); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	ctx := context.WithValue(t.Context(), contextKey{}, wantValue)
+	if err := bus.HandleCtx(ctx)(textContextForTest(2, 10, 20, 0, "name")); err != nil {
+		t.Fatalf("HandleCtx() error = %v", err)
+	}
+	if gotValue != wantValue {
+		t.Fatalf("handler context value = %v, want %q", gotValue, wantValue)
 	}
 }
 
@@ -1612,13 +1528,6 @@ func TestExpired(t *testing.T) {
 			},
 			want: true,
 		},
-		{
-			name: "active_lease_prevents_expiration",
-			state: &runtimeState{
-				LastActivity: now.Add(-2 * time.Minute),
-				LeaseUntil:   now.Add(time.Minute),
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -1715,41 +1624,6 @@ func TestAppendBounded(t *testing.T) {
 	}
 }
 
-func TestLeaseContext(t *testing.T) {
-	tests := []struct {
-		name string
-		test func(t *testing.T)
-	}{
-		{
-			name: "lease_context",
-			test: func(t *testing.T) {
-				t.Parallel()
-
-				parent, parentCancel := context.WithCancel(t.Context())
-				ctx, cancel := leaseContext(parent, time.Time{})
-				parentCancel()
-				defer cancel()
-
-				if !errors.Is(ctx.Err(), context.Canceled) {
-					t.Fatalf("leaseContext() error = %v, want %v", ctx.Err(), context.Canceled)
-				}
-
-				deadline := time.Now().Add(time.Minute)
-				deadlineCtx, deadlineCancel := leaseContext(t.Context(), deadline)
-				defer deadlineCancel()
-				got, ok := deadlineCtx.Deadline()
-				if !ok || !got.Equal(deadline) {
-					t.Fatalf("leaseContext() deadline = %v, %t, want %v, true", got, ok, deadline)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, tt.test)
-	}
-}
-
 func TestDefKey(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1773,57 +1647,32 @@ func TestDefKey(t *testing.T) {
 }
 
 func BenchmarkSessionLifecycle(b *testing.B) {
-	tests := []struct {
-		name     string
-		replicas int
-	}{
-		{
-			name:     "one_replica",
-			replicas: 1,
-		},
-		{
-			name:     "four_replicas",
-			replicas: 4,
-		},
-	}
+	store := storage.NewMemory()
+	bus := NewBus(store)
+	flow := newIsolationFlowForTest(b, bus)
+	var sequence atomic.Int64
 
-	for _, tt := range tests {
-		b.Run(tt.name, func(b *testing.B) {
-			store := storage.NewMemory()
-			buses := make([]Bus, tt.replicas)
-			flows := make([]*Flow, tt.replicas)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			userID := sequence.Add(1)
+			startCtx := textContextForTest(1, userID, 100, 0, "start")
+			updateCtx := textContextForTest(2, userID, 100, 0, "answer")
 
-			for i := range tt.replicas {
-				buses[i] = NewBus(store)
-				flows[i] = newIsolationFlowForTest(b, buses[i])
+			if err := bus.Start(b.Context(), startCtx, flow); err != nil {
+				b.Errorf("Start() error = %v", err)
+				continue
 			}
-
-			var sequence atomic.Int64
-
-			b.ReportAllocs()
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					userID := sequence.Add(1)
-					busIndex := int(userID % int64(tt.replicas))
-					startCtx := textContextForTest(1, userID, 100, 0, "start")
-					updateCtx := textContextForTest(2, userID, 100, 0, "answer")
-
-					if err := buses[busIndex].Start(context.Background(), startCtx, flows[busIndex]); err != nil {
-						b.Errorf("Start() error = %v", err)
-						continue
-					}
-					if err := buses[busIndex].Handle(updateCtx); err != nil {
-						b.Errorf("Handle() error = %v", err)
-						continue
-					}
-					if err := buses[busIndex].Cancel(context.Background(), updateCtx); err != nil {
-						b.Errorf("Cancel() error = %v", err)
-					}
-				}
-			})
-		})
-	}
+			if err := bus.Handle(updateCtx); err != nil {
+				b.Errorf("Handle() error = %v", err)
+				continue
+			}
+			if err := bus.Cancel(b.Context(), updateCtx); err != nil {
+				b.Errorf("Cancel() error = %v", err)
+			}
+		}
+	})
 }
 
 func newIsolationFlowForTest(tb testing.TB, bus Bus) *Flow {

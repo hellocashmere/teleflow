@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/hellocashmere/teleflow"
@@ -15,6 +17,13 @@ import (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -28,7 +37,12 @@ func main() {
 	bus := teleflow.NewBus(storage.NewMemory())
 
 	bot.Handle(tele.OnText, bus.Handle)
-	bot.Handle("/trip", TripHandler(bus))
+	bot.Handle("/trip", TripHandler(ctx, bus))
+
+	go func() {
+		<-ctx.Done()
+		bot.Stop()
+	}()
 
 	log.Println("telegram bot started successfully")
 	bot.Start()
@@ -36,7 +50,8 @@ func main() {
 	log.Println("telegram bot stopped")
 }
 
-func TripHandler(bus teleflow.Bus) tele.HandlerFunc {
+// TripHandler returns a command handler that builds and starts the trip flow.
+func TripHandler(ctx context.Context, bus teleflow.Bus) tele.HandlerFunc {
 	trip := bus.NewFlow(teleflow.FlowConfig{
 		Name:        "trip",
 		Version:     1,
@@ -211,6 +226,6 @@ func TripHandler(bus teleflow.Bus) tele.HandlerFunc {
 			return fmt.Errorf("build trip flow: %w", err)
 		}
 
-		return bus.Start(context.Background(), c, trip)
+		return bus.Start(ctx, c, trip)
 	}
 }

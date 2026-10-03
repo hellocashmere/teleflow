@@ -5,25 +5,20 @@ import (
 	"time"
 )
 
+// Storage persists opaque session state and must be safe for concurrent use.
+//
+// Implementations do not need compare-and-swap or distributed locking because a Bus serializes updates locally.
 type Storage interface {
-	// Get returns a value or ErrKeyNotFound.
+	// Get returns the value associated with key.
+	//
+	// A missing or expired key must return an error that matches ErrKeyNotFound with errors.Is.
 	Get(ctx context.Context, key string) ([]byte, error)
 
-	// Set stores a value with optional expiration.
+	// Set stores value under key and replaces any existing value.
+	//
+	// A positive expiration sets a time to live, while a zero or negative expiration keeps the value until it is replaced or deleted.
 	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
 
-	// Delete removes a value and ignores missing keys.
+	// Delete removes key and returns nil when it is absent.
 	Delete(ctx context.Context, key string) error
-
-	// CompareAndSwap replaces expected or creates a missing key when expected is nil.
-	CompareAndSwap(
-		ctx context.Context,
-		key string,
-		expected []byte,
-		value []byte,
-		expiration time.Duration,
-	) (bool, error)
-
-	// CompareAndDelete removes a key only when its value matches expected.
-	CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
 }

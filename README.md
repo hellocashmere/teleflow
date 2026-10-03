@@ -6,23 +6,25 @@
 [![codecov](https://codecov.io/gh/hellocashmere/teleflow/branch/main/graph/badge.svg)](https://codecov.io/gh/hellocashmere/teleflow)
 [![License](https://img.shields.io/github/license/hellocashmere/teleflow)](LICENSE)
 
-```sh
-go get github.com/hellocashmere/teleflow
-```
-
 - [Overview](#overview)
+- [Installation](#installation)
 - [Getting Started](#getting-started)
 - [Context](#context)
 - [License](#license)
 
-# Overview
+## Overview
 
-Teleflow is a package which is designed to solve the problem of dialogs using
-[Telebot](https://github.com/tucnak/telebot). It provides a simple and efficient
-way to receive and process both input text and is capable of handling button
-clicks, location sending, contacts, etc.
+Teleflow is a conversation-flow package for [Telebot](https://github.com/tucnak/telebot).
+It defines ordered, versioned steps, persists session state through a small storage interface, and routes text, callbacks, media, and other Telebot events to active flows.
+Session state includes typed data and bounded step history.
 
-# Getting Started
+## Installation
+
+```sh
+go get github.com/hellocashmere/teleflow
+```
+
+## Getting Started
 
 The following bot collects a destination and traveler count in two steps:
 
@@ -34,8 +36,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/hellocashmere/teleflow"
@@ -44,6 +48,13 @@ import (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
 	pref := tele.Settings{
 		Token:  os.Getenv("TOKEN"),
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -57,13 +68,18 @@ func main() {
 	bus := teleflow.NewBus(storage.NewMemory())
 
 	bot.Handle(tele.OnText, bus.Handle)
-	bot.Handle("/trip", TripHandler(bus))
+	bot.Handle("/trip", TripHandler(ctx, bus))
+
+	go func() {
+		<-ctx.Done()
+		bot.Stop()
+	}()
 
 	log.Println("telegram bot started successfully")
 	bot.Start()
 }
 
-func TripHandler(bus teleflow.Bus) tele.HandlerFunc {
+func TripHandler(ctx context.Context, bus teleflow.Bus) tele.HandlerFunc {
 	trip := bus.NewFlow(teleflow.FlowConfig{
 		Name:        "trip",
 		Version:     1,
@@ -124,26 +140,25 @@ func TripHandler(bus teleflow.Bus) tele.HandlerFunc {
 			return fmt.Errorf("build trip flow: %w", err)
 		}
 
-		return bus.Start(context.Background(), c, trip)
+		return bus.Start(ctx, c, trip)
 	}
 }
 ```
 
-`bus.Handle` receives updates for active flows. The command handler builds the
-flow definition and starts a new session. Returning `Next` from the final step
-completes the flow and removes its stored state.
+`bus.Handle` receives updates for active flows using a background context.
+The command handler builds the flow definition before calling `Start`.
+`Start` creates a session when none exists, resumes a pending step-entry callback, or leaves an active session unchanged.
+Returning `Next` from the final step completes the flow and removes its stored state.
 
-Register `bus.Handle` for every Telebot event used by your steps. For example,
-an inline-button flow also needs `bot.Handle(tele.OnCallback, bus.Handle)`.
+Register `bus.Handle` for every Telebot event used by the steps.
+For example, an inline-button flow also needs `bot.Handle(tele.OnCallback, bus.Handle)`.
 
-# Context
+## Context
 
 Step callbacks work with two different contexts:
 
-- `tele.Context` contains the current Telegram update and methods such as
-  `Send`, `Edit`, `Text`, `Message`, and `Callback`.
-- `teleflow.Context` contains the current flow state, typed data, metadata, and
-  transition methods.
+- `tele.Context` contains the current Telegram update and methods such as `Send`, `Edit`, `Text`, `Message`, and `Callback`.
+- `teleflow.Context` contains the current flow state, typed data, metadata, and transition methods.
 
 Use `teleflow.Context` to pass data between steps:
 
@@ -155,9 +170,8 @@ if err := fc.SetString("company", "Acme"); err != nil {
 company, ok := fc.GetString("company")
 ```
 
-Typed methods are available for strings, booleans, integers, floating-point
-numbers, durations, and times. `Delete` removes a value, while `Has` checks
-whether a key exists.
+Typed methods are available for strings, booleans, integers, floating-point numbers, durations, and times.
+`Delete` removes a value, while `Has` checks whether a key exists.
 
 The same context controls the next transition:
 
@@ -168,14 +182,24 @@ return fc.Back(), nil
 return fc.Go("company_details"), nil
 ```
 
-`Current` and `Step` return the active step name. `Depth` reports the history
-depth, and `CanBack` reports whether `Back` can return to an earlier step. A
-`teleflow.Context` belongs to one callback, but the data written through it is
-persisted with the flow state.
+`Current` identifies the step whose handler is running, while `Step` reads the active step from the working session state.
+`Depth` reports the retained history depth at the start of the callback, and `CanBack` reports whether that history contained a previous step.
+A `teleflow.Context` belongs to one callback.
+Its data changes are persisted only when the callback returns a valid transition without an error and the updated state is written successfully.
 
-The standard library `context.Context` is used for cancellation and deadlines.
-It is passed to `Bus.Start`, `Bus.Cancel`, and storage methods. Use
-`Flow.StepContext` when step work must observe cancellation:
+The standard library `context.Context` controls cancellation and deadlines for storage operations and context-aware callbacks.
+It is accepted by `Bus.Start`, `Bus.HandleCtx`, and `Bus.Cancel`, and passed to storage methods.
+Only callbacks registered with `Flow.StepContext` receive it; callbacks registered with `Flow.Step` do not.
+Use `Bus.HandleCtx(ctx)` instead of `Bus.Handle` when update handling must observe cancellation or deadlines:
+
+```go
+handler := bus.HandleCtx(ctx)
+
+bot.Handle(tele.OnText, handler)
+bot.Handle(tele.OnCallback, handler)
+```
+
+Use `Flow.StepContext` together with `Start(ctx, ...)` and `HandleCtx(ctx)` when step callbacks must observe cancellation:
 
 ```go
 flow.StepContext(
@@ -198,9 +222,6 @@ flow.StepContext(
 )
 ```
 
-An omitted `IdleTimeout` uses `teleflow.DefaultIdleTimeout` of 24 hours. An
-omitted `HistoryLimit` uses `teleflow.DefaultHistoryLimit` of 64 entries.
-
-# License
+## License
 
 Teleflow is distributed under the [MIT License](LICENSE).

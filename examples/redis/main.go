@@ -5,27 +5,38 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/hellocashmere/teleflow"
-	"github.com/redis/go-redis/v9"
+	"github.com/hellocashmere/teleflow/examples/redis/redis"
+	redissdk "github.com/redis/go-redis/v9"
 	tele "gopkg.in/telebot.v4"
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
 
-	client := redis.NewClient(&redis.Options{Addr: envOr("REDIS_ADDR", "localhost:6379")})
+	connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	store, err := redis.New(connectCtx, &redissdk.Options{
+		Addr: envOr("REDIS_ADDR", "localhost:6379"),
+	}, "teleflow:")
+	cancel()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	defer func() {
-		if err := client.Close(); err != nil {
+		if err := store.Close(); err != nil {
 			log.Printf("close redis: %v", err)
 		}
 	}()
-
-	if err := client.Ping(ctx).Err(); err != nil {
-		log.Fatalf("connect to redis: %v", err)
-	}
 
 	bot, err := tele.NewBot(tele.Settings{
 		Token:  os.Getenv("TOKEN"),
@@ -35,7 +46,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	store := newRedisStorage(client, "teleflow:")
 	bus := teleflow.NewBus(store)
 	greeting := newGreetingFlow(bus)
 
@@ -44,10 +54,15 @@ func main() {
 	}
 
 	bot.Handle("/greet", func(c tele.Context) error {
-		return bus.Start(context.Background(), c, greeting)
+		return bus.Start(ctx, c, greeting)
 	})
 
-	bot.Handle(tele.OnText, bus.Handle)
+	bot.Handle(tele.OnText, bus.HandleCtx(ctx))
+
+	go func() {
+		<-ctx.Done()
+		bot.Stop()
+	}()
 
 	log.Println("telegram bot started successfully")
 	bot.Start()

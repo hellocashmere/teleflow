@@ -12,13 +12,13 @@ import (
 )
 
 const (
-	// DefaultIdleTimeout is used when FlowConfig.IdleTimeout is zero.
+	// DefaultIdleTimeout is the maximum session inactivity when FlowConfig.IdleTimeout is zero.
 	DefaultIdleTimeout = 24 * time.Hour
 
-	// DefaultHistoryLimit is used when FlowConfig.HistoryLimit is zero.
+	// DefaultHistoryLimit is the retained step count when FlowConfig.HistoryLimit is zero.
 	DefaultHistoryLimit = 64
 
-	// MaxRuntimeStateSize limits serialized state loaded from or written to storage.
+	// MaxRuntimeStateSize is the largest serialized session state that teleflow reads or writes.
 	MaxRuntimeStateSize = 1 << 20
 )
 
@@ -31,7 +31,9 @@ var (
 	ErrRuntimeStateSize = errors.New("flow: runtime state is too large")
 )
 
-// FlowConfig is used to configure a flow.
+// FlowConfig configures a flow draft.
+//
+// Build validates its values.
 type FlowConfig struct {
 	// Name identifies the flow and must not be empty.
 	Name string
@@ -39,14 +41,19 @@ type FlowConfig struct {
 	// Version identifies the flow definition and must be greater than zero.
 	Version uint
 
-	// IdleTimeout sets when inactive state expires and uses DefaultIdleTimeout when zero.
+	// IdleTimeout controls how long a session may remain inactive.
+	// Zero uses DefaultIdleTimeout, while a negative value is invalid.
 	IdleTimeout time.Duration
 
-	// HistoryLimit sets the retained step count and uses DefaultHistoryLimit when zero.
+	// HistoryLimit controls how many step names are retained for Back.
+	// Zero uses DefaultHistoryLimit, while a negative value is invalid.
 	HistoryLimit int
 }
 
-// Flow describes a registered flow definition and its ordered steps.
+// Flow describes a versioned flow definition.
+//
+// A new Flow is a mutable draft.
+// A successful Build registers it and makes it immutable.
 type Flow struct {
 	owner *bus
 
@@ -74,8 +81,6 @@ type runtimeState struct {
 	LastActivity time.Time                  `json:"last_activity"`
 	LastUpdateID int                        `json:"last_update_id,omitempty"`
 	PendingBegin bool                       `json:"pending_begin,omitempty"`
-	Revision     uint64                     `json:"revision,omitempty"`
-	LeaseUntil   time.Time                  `json:"lease_until,omitzero"`
 }
 
 func cloneRuntime(src *runtimeState) *runtimeState {
@@ -136,17 +141,20 @@ func decodeRuntime(value []byte) (*runtimeState, error) {
 	return &state, nil
 }
 
-// Name returns the flow definition name.
+// Name returns the configured flow name.
 func (f *Flow) Name() string {
 	return f.name
 }
 
-// Version returns the flow definition version.
+// Version returns the configured flow version.
 func (f *Flow) Version() uint {
 	return f.version
 }
 
-// Step adds a named step to the flow draft.
+// Step appends a named step that handles event.
+//
+// The begin callback is optional, but handle must not be nil when the flow is built.
+// Calls made after a successful Build are ignored.
 func (f *Flow) Step(
 	name string,
 	event string,
@@ -170,7 +178,10 @@ func (f *Flow) Step(
 	f.addStep(name, event, beginContext, handleContext)
 }
 
-// StepContext adds a context-aware named step to the flow draft.
+// StepContext appends a named step whose callbacks receive the operation context.
+//
+// The begin callback is optional, but handle must not be nil when the flow is built.
+// Calls made after a successful Build are ignored.
 func (f *Flow) StepContext(
 	name string,
 	event string,
@@ -201,7 +212,9 @@ func (f *Flow) addStep(
 	})
 }
 
-// Build validates and registers the immutable flow definition.
+// Build validates the draft and registers it with the bus that created it.
+//
+// A successful build makes the flow immutable, and later calls to Build return nil.
 func (f *Flow) Build() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

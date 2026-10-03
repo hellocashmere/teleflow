@@ -1,6 +1,6 @@
 module github.com/hellocashmere/teleflow/examples/error_handling
 
-go 1.25.0
+go 1.27.1
 
 require (
 	github.com/hellocashmere/teleflow v0.0.0
